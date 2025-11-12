@@ -42,8 +42,8 @@ class ImprovedHydraulicFracture:
         self.friction_angle = np.radians(45)  # 摩擦角 45度
 
         # 初始应力场
-        self.sigma_H = 8e6  # 最大水平应力 8 MPa
-        self.sigma_h = 8e6  # 最小水平应力 8 MPa
+        self.sigma_H = -8e6  # 最大水平应力 8 MPa
+        self.sigma_h = -8e6  # 最小水平应力 8 MPa
 
         print(f"材料参数: E={self.E:.2e}, GcI={self.GcI}, GcII={self.GcII}")
         print(f"应力场: σ_H={self.sigma_H / 1e6} MPa, σ_h={self.sigma_h / 1e6} MPa")
