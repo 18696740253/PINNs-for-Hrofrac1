@@ -1,0 +1,423 @@
+"""
+PINN Phase-Field Hydraulic Fracturing (2D plane strain) with central injection
+DeepXDE + PyTorch (GPU) implementation
+
+This research template implements a simplified coupled system:
+  - Quasi-static momentum balance (linear elasticity with phase-field degradation)
+  - Phase-field fracture evolution with mixed-mode driving (HI/GcI + HII/GcII)
+  - Transient Darcy flow with Biot coupling
+
+References for model ingredients and coupling ideas are discussed in the accompanying
+chat message.
+
+Author: (Your Name)
+Date: 2025-11-12
+"""
+
+import os
+import math
+import numpy as np
+import deepxde as dde
+from deepxde.backend import torch
+
+dde.backend.set_default_backend("pytorch")
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+torch_dtype = torch.float32
+
+dde.config.set_default_float("float32")
+
+# ----------------------------
+# Physical / model parameters
+# ----------------------------
+E = 40e9  # Pa
+nu = 0.2
+lam = E * nu / ((1 + nu) * (1 - 2 * nu))  # Lame lambda
+mu = E / (2 * (1 + nu))  # Lame mu
+
+alpha_biot = 0.05  # Biot coefficient (matrix)
+
+GcI = 500.0  # N/m (Mode I)
+l0 = 2e-3  # m, length scale parameter
+kappa = 1e-9  # small residual stiffness for numerical stability
+
+# Mohr–Coulomb shear parameters for GcII degradation
+c0 = 5e6  # Pa (cohesion)
+phi_fric = math.radians(45.0)  # friction angle in radians
+sinphi = math.sin(phi_fric)
+cosphi = math.cos(phi_fric)
+
+# Background principal stresses (compressive < 0 in mechanics, here follow + as tension -> use negatives)
+# We'll model a confining pressure by setting sigma0 = -Pc * I; for simplicity keep zeros and rely on u-BCs.
+sigma0_1 = -8e6  # Pa
+sigma0_3 = -8e6  # Pa
+
+# Fluid / Darcy
+rho = 700.0  # kg/m^3 (SC-CO2 density placeholder)
+mu_f = 4.0e-5  # Pa*s
+k_matrix = 1.0e-18  # m^2
+k_frac = 8.33e-10  # m^2
+phi_matrix = 0.05
+phi_frac = 0.12
+c_matrix = 1e-8  # 1/Pa
+c_frac = 1e-8
+
+# Indicator thresholds for fracture vs reservoir (in phase-field space)
+c1 = 0.4
+c2 = 1.0
+
+# Domain / time
+Lx, Ly = 0.24, 0.20  # m
+Tfinal = 0.2  # s (short demonstration; increase for more realism)
+
+# Injection source (Gaussian approximation of point source at center)
+Q_ml_per_min = 85.53  # from paper example (convert to SI rate per thickness)
+Q = Q_ml_per_min / 1e6 / 60.0  # m^3/s per unit thickness
+x0, y0 = Lx / 2.0, Ly / 2.0
+src_sigma = 0.01  # m (source width)
+
+# ----------------------------
+# Helper functions (PyTorch)
+# ----------------------------
+
+def heaviside(x):
+    return 0.5 * (torch.sign(x) + 1.0)
+
+
+def split_strain(eps):
+    """Miehe-type spectral tension/compression split (approx.)
+    eps: [..., 2, 2]
+    Returns: eps_plus, eps_minus
+    """
+    # Eigen-decomposition (symmetric)
+    evals, evecs = torch.linalg.eigh(eps)
+    # Positive/negative parts of eigenvalues
+    evals_plus = torch.clamp(evals, min=0.0)
+    evals_minus = torch.clamp(evals, max=0.0)
+    # Reconstruct tensors: sum_i (e_i^±) n_i ⊗ n_i
+    # Use batch matmul: E = V diag(evals) V^T
+    def rebuild(vals):
+        D = torch.diag_embed(vals)
+        return evecs @ D @ torch.transpose(evecs, -1, -2)
+
+    eps_p = rebuild(evals_plus)
+    eps_m = rebuild(evals_minus)
+    return eps_p, eps_m
+
+
+def strain(u):
+    """Small strain tensor from displacement field u = [ux, uy]."""
+    ux = u[..., 0:1]
+    uy = u[..., 1:2]
+    # Gradients w.r.t x,y using deepxde gradients
+    dux_dx = dde.grad.jacobian(ux, X, i=0, j=0)
+    dux_dy = dde.grad.jacobian(ux, X, i=0, j=1)
+    duy_dx = dde.grad.jacobian(uy, X, i=1, j=0)
+    duy_dy = dde.grad.jacobian(uy, X, i=1, j=1)
+    # Build symmetric strain tensor
+    e11 = dux_dx
+    e22 = duy_dy
+    e12 = 0.5 * (dux_dy + duy_dx)
+    zero = torch.zeros_like(e11)
+    eps = torch.stack(
+        [torch.cat([e11, e12], dim=1), torch.cat([e12, e22], dim=1)], dim=-1
+    )
+    # shape: [N, 2, 2]
+    return eps
+
+
+def deviator(eps):
+    tr = torch.trace(eps)
+    tr = tr.view(-1, 1, 1)
+    I = torch.eye(2, device=eps.device, dtype=eps.dtype).expand_as(eps)
+    return eps - 0.5 * tr * I
+
+
+def elastic_energies(eps):
+    """Return (psi_plus, psi_minus) and (HI, HII) approximations.
+    HI ~ volumetric tension energy, HII ~ shear (deviatoric) energy in tension part.
+    """
+    eps_p, eps_m = split_strain(eps)
+    tr_p = torch.trace(eps_p).view(-1, 1)
+    tr_m = torch.trace(eps_m).view(-1, 1)
+    # Energy densities per Miehe split
+    psi_plus = 0.5 * lam * tr_p**2 + mu * torch.sum(eps_p * eps_p, dim=(-2, -1))
+    psi_minus = 0.5 * lam * tr_m**2 + mu * torch.sum(eps_m * eps_m, dim=(-2, -1))
+
+    # Decomposition for mixed-mode driving (approx.)
+    dev_p = deviator(eps_p)
+    HI = 0.5 * lam * tr_p**2  # volumetric tension energy
+    HII = mu * torch.sum(dev_p * dev_p, dim=(-2, -1))  # shear energy
+    return psi_plus, psi_minus, HI, HII
+
+
+def degradation(phi):
+    return kappa + (1.0 - kappa) * (1.0 - phi) ** 2
+
+
+def stress_effective(eps, phi):
+    psi_plus, psi_minus, _, _ = elastic_energies(eps)
+    eps_p, eps_m = split_strain(eps)
+    d = degradation(phi)
+    # Construct stress from split tensors
+    I = torch.eye(2, device=eps.device, dtype=eps.dtype)
+    tr_p = torch.trace(eps_p).view(-1, 1, 1)
+    tr_m = torch.trace(eps_m).view(-1, 1, 1)
+    sigma = d.view(-1, 1, 1) * (lam * tr_p * I + 2 * mu * eps_p) + (lam * tr_m * I + 2 * mu * eps_m)
+    return sigma
+
+
+def principal_stresses(sig):
+    evals, _ = torch.linalg.eigh(sig)
+    # Sort descending: sigma1 >= sigma2
+    evals_sorted, _ = torch.sort(evals, dim=-1, descending=True)
+    sigma1 = evals_sorted[..., 0]
+    sigma3 = evals_sorted[..., -1]
+    return sigma1, sigma3
+
+
+def indicator_chi(phi):
+    # Linear transition between c1 and c2
+    chi_R = torch.clamp((c2 - phi) / (c2 - c1), 0.0, 1.0)
+    chi_F = 1.0 - chi_R
+    return chi_R, chi_F
+
+
+def permeability(phi):
+    chi_R, chi_F = indicator_chi(phi)
+    return chi_R * k_matrix + chi_F * k_frac
+
+
+def storage_S(phi):
+    chi_R, chi_F = indicator_chi(phi)
+    # Bulk modulus of matrix (plane strain effective) — rough proxy
+    Kbulk = lam + 2.0 * mu / 3.0
+    S_R = c_matrix * phi_matrix + (1.0 - alpha_biot) * (alpha_biot - phi_matrix) / Kbulk
+    S_F = c_frac
+    return chi_R * S_R + chi_F * S_F
+
+
+def GcII_degraded(sigma1, sigma3, p):
+    # Eq. analogue to paper's degradation: ensure positivity and numerical safety
+    # Effective normal stress (compression negative -> convert sign convention):
+    # Use effective principal stresses adding Biot term
+    sig1_eff = sigma1 + alpha_biot * p + sigma0_1
+    sig3_eff = sigma3 + alpha_biot * p + sigma0_3
+    inner = (c0 / torch.tan(torch.tensor(phi_fric, device=sig1_eff.device, dtype=sig1_eff.dtype)) \
+             - 0.5 * (sig1_eff + sig3_eff)) - alpha_biot * p * 0.0  # alpha*p already added above
+    num = (inner ** 2) * (sinphi ** 2) * (cosphi ** 2)
+    denom = (1e-12 + (c0 ** 2))  # scale with cohesion to keep units reasonable
+    GcII = GcI * num / denom
+    # Clamp to a minimum fraction of GcI to avoid zero
+    GcII = torch.clamp(GcII, min=0.1 * GcI, max=1000.0 * GcI)
+    return GcII
+
+
+def source_q(X):
+    # Gaussian source at center for pressure equation; units: 1/s (since equation written per unit thickness)
+    x = X[:, 0:1]
+    y = X[:, 1:2]
+    t = X[:, 2:3]
+    r2 = (x - x0) ** 2 + (y - y0) ** 2
+    gaussian = torch.exp(-r2 / (2.0 * src_sigma ** 2)) / (2.0 * math.pi * src_sigma ** 2)
+    # Time ramp to avoid shock
+    ramp = torch.clamp(t / (0.1 * Tfinal), 0.0, 1.0)
+    return (Q * gaussian * ramp).to(torch_dtype)
+
+# ---------------------------------
+# PDE residuals for DeepXDE (PINN)
+# ---------------------------------
+# Network outputs: [ux, uy, phi, p]
+
+def pde(X, Y):
+    # Inputs
+    x = X[:, 0:1]
+    y = X[:, 1:2]
+    t = X[:, 2:3]
+
+    # Outputs
+    ux = Y[:, 0:1]
+    uy = Y[:, 1:2]
+    phi = Y[:, 2:3]
+    p = Y[:, 3:4]
+
+    # Displacement vector for strain
+    global X  # to allow gradient calls inside strain()
+    # Build a pseudo field tensor for gradients
+    # DeepXDE passes X to grad via closure; we reuse the same X symbol
+
+    # Strain tensor
+    eps = strain(torch.cat([ux, uy], dim=1))  # [N,2,2]
+
+    # Effective stress (tension/compression split with degradation)
+    sig_eff = stress_effective(eps, phi)
+
+    # Momentum balance (quasi-static): div(sigma_eff - alpha p I) = 0
+    I = torch.eye(2, device=sig_eff.device, dtype=sig_eff.dtype)
+    sig_total = sig_eff - alpha_biot * p.view(-1, 1, 1) * I
+
+    # Compute divergence of stress: ∂σ_ij/∂x_j
+    sigma11 = sig_total[:, 0, 0:1]
+    sigma12 = sig_total[:, 0, 1:2]
+    sigma21 = sig_total[:, 1, 0:1]
+    sigma22 = sig_total[:, 1, 1:2]
+
+    divx = dde.grad.jacobian(sigma11, X, i=0, j=0) + dde.grad.jacobian(sigma12, X, i=0, j=1)
+    divy = dde.grad.jacobian(sigma21, X, i=1, j=0) + dde.grad.jacobian(sigma22, X, i=1, j=1)
+
+    mom_x = divx  # = 0
+    mom_y = divy  # = 0
+
+    # Phase-field evolution: [2 l0 (1-k) (HI/GcI + HII/GcII) + 1] phi - l0^2 ∆phi = 2 l0 (1-k) (HI/GcI + HII/GcII)
+    _, _, HI, HII = elastic_energies(eps)
+
+    # GcII degradation via pore pressure + stress state
+    sigma1, sigma3 = principal_stresses(sig_total)
+    GcII_loc = GcII_degraded(sigma1, sigma3, p[:, 0])
+
+    drive = (HI / GcI) + (HII / GcII_loc)
+    lap_phi = dde.grad.hessian(phi, X, i=0, j=0) + dde.grad.hessian(phi, X, i=1, j=1)
+    pf_res = (2.0 * l0 * (1.0 - kappa) * drive + 1.0) * phi - (l0 ** 2) * lap_phi - 2.0 * l0 * (1.0 - kappa) * drive
+
+    # Pressure equation: S ∂p/∂t - ∇·( (K/mu) ∇p ) + alpha * chi_R * ∂ε_vol/∂t = q
+    S_loc = storage_S(phi)
+    K_loc = permeability(phi)
+
+    dp_dt = dde.grad.jacobian(p, X, i=0, j=2)
+
+    dp_dx = dde.grad.jacobian(p, X, i=0, j=0)
+    dp_dy = dde.grad.jacobian(p, X, i=0, j=1)
+
+    K_mu = K_loc / mu_f
+    flux_x = -K_mu * dp_dx
+    flux_y = -K_mu * dp_dy
+
+    dflux_dx = dde.grad.jacobian(flux_x, X, i=0, j=0)
+    dflux_dy = dde.grad.jacobian(flux_y, X, i=0, j=1)
+
+    # Volumetric strain and its time derivative
+    e11 = dde.grad.jacobian(ux, X, i=0, j=0)
+    e22 = dde.grad.jacobian(uy, X, i=0, j=1)
+    eps_vol = e11 + e22
+    depsvol_dt = dde.grad.jacobian(eps_vol, X, i=0, j=2)
+
+    chi_R, _ = indicator_chi(phi)
+
+    q_src = source_q(X)
+
+    pres_res = S_loc * dp_dt - (dflux_dx + dflux_dy) + alpha_biot * chi_R * depsvol_dt - q_src
+
+    return [mom_x, mom_y, pf_res, pres_res]
+
+
+# ---------------------------------
+# Geometry + Time domain + BC/IC
+# ---------------------------------
+geom = dde.geometry.Rectangle([0.0, 0.0], [Lx, Ly])
+time_dom = dde.geometry.TimeDomain(0.0, Tfinal)
+geomtime = dde.geometry.GeometryXTime(geom, time_dom)
+
+# Boundary helpers
+
+def on_boundary(x, on_b):
+    return on_b
+
+# Dirichlet BCs: fixed boundaries u = 0 (roller constraints would be more physical)
+zero = lambda x: 0.0
+bc_ux = dde.DirichletBC(geomtime, zero, lambda x, on_b: on_b, component=0)
+bc_uy = dde.DirichletBC(geomtime, zero, lambda x, on_b: on_b, component=1)
+
+# Pressure BC: p = 0 at outer boundary
+bc_p = dde.DirichletBC(geomtime, zero, on_boundary, component=3)
+
+# Phase-field Neumann (∂phi/∂n = 0) is natural; we add soft clamp 0<=phi<=1 via boundary condition on values
+phi_min = dde.NeumannBC(geomtime, lambda x: 0.0, on_boundary, component=2)
+
+# Initial conditions
+
+def ic_ux(x):
+    return 0.0
+
+
+def ic_uy(x):
+    return 0.0
+
+
+def ic_phi(x):
+    # small initial flaw around the injector (smoothed)
+    r2 = (x[0] - x0) ** 2 + (x[1] - y0) ** 2
+    return float(np.exp(-r2 / (2.0 * (2.0 * l0) ** 2)) * 0.1)
+
+
+def ic_p(x):
+    return 0.0
+
+ic0 = dde.IC(geomtime, ic_ux, lambda x, on_b: np.isclose(x[2], 0.0), component=0)
+ic1 = dde.IC(geomtime, ic_uy, lambda x, on_b: np.isclose(x[2], 0.0), component=1)
+ic2 = dde.IC(geomtime, ic_phi, lambda x, on_b: np.isclose(x[2], 0.0), component=2)
+ic3 = dde.IC(geomtime, ic_p, lambda x, on_b: np.isclose(x[2], 0.0), component=3)
+
+# ---------------------------------
+# Model setup
+# ---------------------------------
+
+# Sampling
+nt = 50  # time levels for training points
+nx = 61
+ny = 51
+
+observe_times = np.linspace(0.0, Tfinal, nt)
+
+data = dde.data.TimePDE(
+    geomtime,
+    pde,
+    [bc_ux, bc_uy, bc_p, phi_min, ic0, ic1, ic2, ic3],
+    num_domain=nx * ny * nt,
+    num_boundary=2 * (nx + ny) * nt,
+    num_initial=nx * ny,
+    train_distribution="uniform",
+)
+
+# Network
+layer_size = [3] + [128] * 6 + [4]  # inputs: x,y,t -> outputs: ux,uy,phi,p
+net = dde.maps.FNN(layer_size, "tanh", "Glorot uniform")
+
+# Tell DeepXDE to use PyTorch module on GPU
+net.apply(lambda m: m.to(device))
+
+model = dde.Model(data, net)
+
+# Optimizers
+adam = torch.optim.Adam(model.net.parameters(), lr=1e-3)
+model.compile(optimizer=adam, loss_weights=[1.0, 1.0, 1.0, 1.0], metrics=None)
+
+losshistory, train_state = model.train(iterations=15000, display_every=1000)
+
+# Switch to L-BFGS for refinement
+model.compile("L-BFGS")
+losshistory, train_state = model.train()
+
+# ----------------------------
+# Post-processing helpers
+# ----------------------------
+
+def save_fields(model, t_query= Tfinal, nx_out=121, ny_out=101, outdir="outputs"):
+    os.makedirs(outdir, exist_ok=True)
+    xs = np.linspace(0, Lx, nx_out)
+    ys = np.linspace(0, Ly, ny_out)
+    Xg, Yg = np.meshgrid(xs, ys)
+    Tg = np.full_like(Xg, t_query)
+    XYT = np.stack([Xg, Yg, Tg], axis=-1).reshape(-1, 3)
+    pred = model.predict(XYT)
+    ux = pred[:, 0].reshape(ny_out, nx_out)
+    uy = pred[:, 1].reshape(ny_out, nx_out)
+    phi = pred[:, 2].reshape(ny_out, nx_out)
+    p = pred[:, 3].reshape(ny_out, nx_out)
+    np.savez(os.path.join(outdir, f"fields_t{t_query:.3f}.npz"), x=xs, y=ys, ux=ux, uy=uy, phi=phi, p=p)
+    print(f"Saved fields to {outdir}/fields_t{t_query:.3f}.npz")
+
+
+if __name__ == "__main__":
+    save_fields(model, Tfinal)
+    print("Done. Consider visualizing phi(x,y,t) to see damage/fracture patterns around the injector.")
