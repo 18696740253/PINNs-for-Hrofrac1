@@ -389,10 +389,12 @@ ny = int(os.getenv("PINN_NY", 28))
 
 observe_times = np.linspace(0.0, Tfinal, nt)
 
+conditions = [bc_ux, bc_uy, bc_p, phi_min, ic0, ic1, ic2, ic3]
+
 data = dde.data.TimePDE(
     geomtime,
     pde,
-    [bc_ux, bc_uy, bc_p, phi_min, ic0, ic1, ic2, ic3],
+    conditions,
     num_domain=nx * ny * nt,
     num_boundary=2 * (nx + ny) * nt,
     num_initial=nx * ny,
@@ -414,7 +416,9 @@ model = dde.Model(data, net)
 
 # Optimizers
 adam = torch.optim.Adam(model.net.parameters(), lr=1e-3)
-model.compile(optimizer=adam, loss_weights=[1.0, 1.0, 1.0, 1.0], metrics=None)
+num_pde_residuals = 4  # [mom_x, mom_y, pf_res, pres_res]
+loss_weights = [1.0] * (num_pde_residuals + len(conditions))
+model.compile(optimizer=adam, loss_weights=loss_weights, metrics=None)
 
 losshistory, train_state = model.train(iterations=15000, display_every=1000)
 
