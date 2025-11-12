@@ -286,7 +286,14 @@ def pde(X, Y):
     GcII_loc = GcII_degraded(sigma1, sigma3, p[:, 0])
 
     drive = (HI / GcI) + (HII / GcII_loc)
-    lap_phi = dde.grad.hessian(phi, X, i=0, j=0) + dde.grad.hessian(phi, X, i=1, j=1)
+    # ``phi`` has a single output component, therefore the ``component`` (``i``)
+    # index must always be ``0`` when requesting higher-order derivatives.  Using
+    # ``i=1`` silently fails in some DeepXDE versions and may even raise
+    # ``ValueError: i=1 is not valid`` in others, which aborts training right
+    # after the very first loss evaluation.  This manifested as the optimiser
+    # appearing to be stuck at step 0 in the training log.  With the corrected
+    # component index we obtain the intended Laplacian ∂²φ/∂x² + ∂²φ/∂y².
+    lap_phi = dde.grad.hessian(phi, X, i=0, j=0) + dde.grad.hessian(phi, X, i=0, j=1)
     pf_res = (2.0 * l0 * (1.0 - kappa) * drive + 1.0) * phi - (l0 ** 2) * lap_phi - 2.0 * l0 * (1.0 - kappa) * drive
 
     # Pressure equation: S ∂p/∂t - ∇·( (K/mu) ∇p ) + alpha * chi_R * ∂ε_vol/∂t = q
