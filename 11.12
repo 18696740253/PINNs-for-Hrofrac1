@@ -355,8 +355,12 @@ def ic_uy(x):
 
 def ic_phi(x):
     # small initial flaw around the injector (smoothed)
-    r2 = (x[0] - x0) ** 2 + (x[1] - y0) ** 2
-    return float(np.exp(-r2 / (2.0 * (2.0 * l0) ** 2)) * 0.1)
+    X = np.asarray(x)
+    if X.ndim == 1:
+        r2 = (X[0] - x0) ** 2 + (X[1] - y0) ** 2
+        return np.exp(-r2 / (2.0 * (2.0 * l0) ** 2)) * 0.1
+    r2 = (X[:, 0] - x0) ** 2 + (X[:, 1] - y0) ** 2
+    return np.exp(-r2 / (2.0 * (2.0 * l0) ** 2)) * 0.1
 
 
 def ic_p(x):
