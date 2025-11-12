@@ -1,0 +1,492 @@
+1import os
+import deepxde as dde
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import time
+
+os.environ["DDE_BACKEND"] = "pytorch"
+
+# 设置随机种子以确保结果可重复
+np.random.seed(42)
+torch.manual_seed(42)
+
+
+class ImprovedHydraulicFracture:
+    """
+    基于文献的改进水力压裂相场模型 - 修复版本
+    """
+
+    def __init__(self):
+        """初始化模型参数 - 按照论文Table 1设置"""
+        # 材料参数（按照论文Table 1设置）
+        self.E = 40e9  # 杨氏模量 40 GPa
+        self.nu = 0.2  # 泊松比
+        self.GcI = 500  # Mode-I临界能量释放率 (N/m)
+        self.GcII = 1500  # Mode-II临界能量释放率 (N/m)
+        self.l0 = 0.002  # 相场长度尺度参数 (m)
+
+        # 流体参数（按照论文Table 1设置）
+        self.k_matrix = 1e-18  # 基质渗透率 (m²)
+        self.k_fracture = 8.33e-10  # 裂缝渗透率 (m²)
+        self.mu_f = 4e-5  # 流体粘度 (Pa·s)
+        self.alpha_matrix = 0.05  # 基质Biot系数
+        self.alpha_fracture = 1.0  # 裂缝Biot系数
+
+        # 计算拉梅常数
+        self.lambda_lame = self.E * self.nu / ((1 + self.nu) * (1 - 2 * self.nu))
+        self.mu_lame = self.E / (2 * (1 + self.nu))
+
+        # 岩石强度参数
+        self.cohesion = 5e6  # 凝聚力 5 MPa
+        self.friction_angle = np.radians(45)  # 摩擦角 45度
+
+        # 初始应力场
+        self.sigma_H = 8e6  # 最大水平应力 8 MPa
+        self.sigma_h = 8e6  # 最小水平应力 8 MPa
+
+        print(f"材料参数: E={self.E:.2e}, GcI={self.GcI}, GcII={self.GcII}")
+        print(f"应力场: σ_H={self.sigma_H / 1e6} MPa, σ_h={self.sigma_h / 1e6} MPa")
+
+        # 几何参数
+        self.Lx = 0.05
+        self.Ly = 0.05
+
+        # 注入参数
+        self.injection_rate = 5e-8
+        self.injection_time = 1.0
+
+        # 设置注入点位置
+        self.injection_x = self.Lx / 2
+        self.injection_y = self.Ly / 2
+
+        # 训练参数
+        self.num_domain = 1000
+        self.num_boundary = 300
+        self.num_initial = 200
+
+        # 数值稳定性参数
+        self.k = 1e-9
+
+        # 相场参数
+        self.c1 = 0.4
+        self.c2 = 1.0
+
+        # 调试计数器
+        self.iteration_count = 0
+        self.debug_data = []
+
+    def simplified_spectral_decomposition(self, epsilon):
+        """
+        简化的谱分解方法
+        """
+        # 提取应变分量
+        epsilon_xx = epsilon[:, 0:1]
+        epsilon_yy = epsilon[:, 1:2]
+        epsilon_xy = epsilon[:, 2:3] if epsilon.shape[1] > 2 else torch.zeros_like(epsilon_xx)
+
+        # 计算主应变（近似方法）
+        trace_epsilon = epsilon_xx + epsilon_yy
+
+        # 拉伸和压缩部分
+        epsilon_plus = torch.zeros_like(epsilon)
+        epsilon_minus = torch.zeros_like(epsilon)
+
+        # 简化的分解 - 主要考虑体积应变
+        trace_plus = torch.where(trace_epsilon > 0, trace_epsilon, torch.zeros_like(trace_epsilon))
+        trace_minus = torch.where(trace_epsilon < 0, trace_epsilon, torch.zeros_like(trace_epsilon))
+
+        # 各向同性假设下的分解
+        epsilon_plus[:, 0:1] = 0.5 * trace_plus
+        epsilon_plus[:, 1:2] = 0.5 * trace_plus
+        epsilon_plus[:, 2:3] = epsilon_xy * torch.where(trace_epsilon > 0, 1.0, 0.0)
+
+        epsilon_minus[:, 0:1] = 0.5 * trace_minus
+        epsilon_minus[:, 1:2] = 0.5 * trace_minus
+        epsilon_minus[:, 2:3] = epsilon_xy * torch.where(trace_epsilon <= 0, 1.0, 0.0)
+
+        return epsilon_plus, epsilon_minus
+
+    def compute_mixed_mode_strain_energy(self, epsilon):
+        """
+        计算混合模式应变能
+        """
+        epsilon_plus, epsilon_minus = self.simplified_spectral_decomposition(epsilon)
+
+        # 计算主应变迹
+        trace_epsilon = epsilon[:, 0:1] + epsilon[:, 1:2]
+
+        # Mode-I贡献（体积拉伸）
+        H_I = 0.5 * self.lambda_lame * torch.where(trace_epsilon > 0, trace_epsilon,
+                                                   torch.zeros_like(trace_epsilon)) ** 2
+
+        # Mode-II贡献（偏应变）
+        H_II = self.mu_lame * (epsilon_plus[:, 0:1] ** 2 + epsilon_plus[:, 1:2] ** 2 + 2 * epsilon_plus[:, 2:3] ** 2)
+
+        return H_I, H_II
+
+    def compute_degraded_GcII(self, p, effective_stress):
+        """
+        计算退化的GcII
+        """
+        # 简化的有效应力计算
+        mean_effective_stress = (effective_stress[:, 0:1] + effective_stress[:, 1:2]) / 2
+
+        # 简化的退化模型
+        term = self.cohesion - mean_effective_stress - self.alpha_matrix * p
+
+        # 简化的GcII计算
+        sin_phi = torch.sin(torch.tensor(self.friction_angle))
+        cos_phi = torch.cos(torch.tensor(self.friction_angle))
+
+        GcII_degraded = (self.GcI / (self.cohesion ** 2)) * (sin_phi ** 2) * (cos_phi ** 2) * (term ** 2)
+
+        # 设置GcII的上下限
+        GcII_degraded = torch.clamp(GcII_degraded, min=0.1 * self.GcI, max=10 * self.GcI)
+
+        return GcII_degraded
+
+    def pde(self, x, y):
+        """
+        简化的PDE定义
+        """
+        self.iteration_count += 1
+
+        u_x, u_y, p, d = y[:, 0:1], y[:, 1:2], y[:, 2:3], y[:, 3:4]
+
+        # 计算应变分量
+        u_x_x = dde.grad.jacobian(y, x, i=0, j=0)
+        u_y_y = dde.grad.jacobian(y, x, i=1, j=1)
+        u_x_y = dde.grad.jacobian(y, x, i=0, j=1)
+        u_y_x = dde.grad.jacobian(y, x, i=1, j=0)
+
+        # 应变张量
+        epsilon = torch.cat([u_x_x, u_y_y, 0.5 * (u_x_y + u_y_x)], dim=1)
+
+        # 计算压力对时间的偏导数
+        p_t = dde.grad.jacobian(y, x, i=2, j=2)
+
+        # 计算相场变量的偏导数
+        d_x = dde.grad.jacobian(y, x, i=3, j=0)
+        d_y = dde.grad.jacobian(y, x, i=3, j=1)
+        d_xx = dde.grad.jacobian(d_x, x, i=0, j=0)
+        d_yy = dde.grad.jacobian(d_y, x, i=0, j=1)
+        laplacian_d = d_xx + d_yy
+
+        # 简化的谱分解
+        epsilon_plus, epsilon_minus = self.simplified_spectral_decomposition(epsilon)
+
+        # 计算混合模式应变能
+        H_I, H_II = self.compute_mixed_mode_strain_energy(epsilon)
+
+        # 简化的有效应力计算
+        trace_epsilon = epsilon[:, 0:1] + epsilon[:, 1:2]
+        mean_effective_stress = torch.cat([
+            (self.lambda_lame * trace_epsilon + 2 * self.mu_lame * epsilon[:,
+                                                                   0:1] - self.alpha_matrix * p + self.sigma_H),
+            (self.lambda_lame * trace_epsilon + 2 * self.mu_lame * epsilon[:,
+                                                                   1:2] - self.alpha_matrix * p + self.sigma_h)
+        ], dim=1)
+
+        # 计算退化的GcII
+        GcII_degraded = self.compute_degraded_GcII(p, mean_effective_stress)
+
+        # 退化函数
+        g_d = (1 - d) ** 2 + self.k
+
+        # 简化的应力计算
+        lambda_lame_tensor = torch.tensor(self.lambda_lame, dtype=p.dtype, device=p.device)
+        mu_lame_tensor = torch.tensor(self.mu_lame, dtype=p.dtype, device=p.device)
+
+        # 简化的应力计算
+        trace_epsilon_plus = torch.where(trace_epsilon > 0, trace_epsilon, torch.zeros_like(trace_epsilon))
+        sigma_xx = g_d * (lambda_lame_tensor * trace_epsilon_plus + 2 * mu_lame_tensor * epsilon_plus[:, 0:1]) + \
+                   (lambda_lame_tensor * torch.where(trace_epsilon < 0, trace_epsilon, torch.zeros_like(
+                       trace_epsilon)) + 2 * mu_lame_tensor * epsilon_minus[:, 0:1])
+        sigma_yy = g_d * (lambda_lame_tensor * trace_epsilon_plus + 2 * mu_lame_tensor * epsilon_plus[:, 1:2]) + \
+                   (lambda_lame_tensor * torch.where(trace_epsilon < 0, trace_epsilon, torch.zeros_like(
+                       trace_epsilon)) + 2 * mu_lame_tensor * epsilon_minus[:, 1:2])
+        sigma_xy = g_d * (2 * mu_lame_tensor * epsilon_plus[:, 2:3]) + (2 * mu_lame_tensor * epsilon_minus[:, 2:3])
+
+        # 总应力
+        sigma_H_tensor = torch.tensor(self.sigma_H, dtype=p.dtype, device=p.device)
+        sigma_h_tensor = torch.tensor(self.sigma_h, dtype=p.dtype, device=p.device)
+
+        total_sigma_xx = sigma_xx - self.alpha_matrix * p + g_d * sigma_H_tensor
+        total_sigma_yy = sigma_yy - self.alpha_matrix * p + g_d * sigma_h_tensor
+        total_sigma_xy = sigma_xy
+
+        # 动量平衡方程
+        momentum_x = dde.grad.jacobian(total_sigma_xx, x, i=0, j=0) + dde.grad.jacobian(total_sigma_xy, x, i=0, j=1)
+        momentum_y = dde.grad.jacobian(total_sigma_xy, x, i=0, j=0) + dde.grad.jacobian(total_sigma_yy, x, i=0, j=1)
+
+        # 相场控制方程
+        GcI_tensor = torch.tensor(self.GcI, dtype=p.dtype, device=p.device)
+
+        # 驱动力计算
+        driving_force = (H_I / GcI_tensor) + (H_II / GcII_degraded)
+
+        # 相场方程
+        phase_field = d - (self.l0 ** 2) * laplacian_d - 2 * self.l0 * driving_force
+
+        # 计算压力的拉普拉斯算子
+        p_x = dde.grad.jacobian(p, x, i=0, j=0)
+        p_y = dde.grad.jacobian(p, x, i=0, j=1)
+        p_xx = dde.grad.jacobian(p_x, x, i=0, j=0)
+        p_yy = dde.grad.jacobian(p_y, x, i=0, j=1)
+        laplacian_p = p_xx + p_yy
+
+        # 提取空间坐标
+        x_coord, y_coord = x[:, 0:1], x[:, 1:2]
+
+        # 注入源项
+        injection_source = self.injection_rate * torch.exp(
+            -((x_coord - self.injection_x) ** 2 + (y_coord - self.injection_y) ** 2) / (2 * (0.005) ** 2))
+
+        # 简化的流体流动方程
+        k_matrix_tensor = torch.tensor(self.k_matrix, dtype=p.dtype, device=p.device)
+        k_fracture_tensor = torch.tensor(self.k_fracture, dtype=p.dtype, device=p.device)
+        mu_f_tensor = torch.tensor(self.mu_f, dtype=p.dtype, device=p.device)
+
+        # 简化的渗透率过渡
+        chi_R = torch.where(d < self.c1, torch.ones_like(d),
+                            torch.where(d > self.c2, torch.zeros_like(d),
+                                        (self.c2 - d) / (self.c2 - self.c1)))
+        chi_F = 1 - chi_R
+
+        k_eff = k_matrix_tensor * chi_R + k_fracture_tensor * chi_F
+        fluid_flow = p_t - (k_eff / mu_f_tensor) * laplacian_p - injection_source
+
+        # 调试信息
+        if self.iteration_count % 500 == 0:
+            with torch.no_grad():
+                max_p = torch.max(p).item()
+                min_p = torch.min(p).item()
+                max_d = torch.max(d).item()
+                min_d = torch.min(d).item()
+
+                print(f"Iter {self.iteration_count}: Pressure [{min_p:.2e}, {max_p:.2e}], "
+                      f"Damage [{min_d:.3f}, {max_d:.3f}]")
+
+        return [momentum_x, momentum_y, fluid_flow, phase_field]
+
+    def boundary_conditions(self, geomtime):
+        """修复边界条件定义"""
+        bc_list = []
+
+        # 应力边界条件
+        confining_pressure = 8e6  # 8 MPa
+
+        # 修复：使用正确的函数签名
+        def stress_boundary_x(x):
+            # 对于应力边界，返回应力值
+            return np.full((len(x), 1), -confining_pressure)
+
+        def stress_boundary_y(x):
+            return np.full((len(x), 1), -confining_pressure)
+
+        # 修复：使用正确的边界条件定义
+        # 对于Neumann边界条件，使用正确的组件
+        bc_momentum_x = dde.icbc.NeumannBC(
+            geomtime,
+            stress_boundary_x,
+            lambda _, on_boundary: on_boundary,
+            component=0
+        )
+        bc_momentum_y = dde.icbc.NeumannBC(
+            geomtime,
+            stress_boundary_y,
+            lambda _, on_boundary: on_boundary,
+            component=1
+        )
+
+        bc_list.extend([bc_momentum_x, bc_momentum_y])
+
+        # 压力边界条件
+        bc_pressure = dde.icbc.DirichletBC(
+            geomtime,
+            lambda x: np.zeros((len(x), 1)),
+            lambda x, on_boundary: on_boundary,
+            component=2
+        )
+        bc_list.append(bc_pressure)
+
+        # 相场边界条件 - 修复：使用正确的函数定义
+        def phase_field_boundary(x):
+            return np.zeros((len(x), 1))
+
+        bc_phase_field = dde.icbc.NeumannBC(
+            geomtime,
+            phase_field_boundary,
+            lambda _, on_boundary: on_boundary,
+            component=3
+        )
+        bc_list.append(bc_phase_field)
+
+        print(f"Applied {len(bc_list)} boundary conditions")
+
+        return bc_list
+
+    def initial_conditions(self, geomtime):
+        """初始条件"""
+
+        def u_x_initial(x):
+            return np.zeros((len(x), 1))
+
+        def u_y_initial(x):
+            return np.zeros((len(x), 1))
+
+        def p_initial(x):
+            return np.zeros((len(x), 1))
+
+        def d_initial(x):
+            d = np.zeros((len(x), 1))
+            cx, cy = self.injection_x, self.injection_y
+
+            for i in range(len(x)):
+                dist = np.sqrt((x[i, 0] - cx) ** 2 + (x[i, 1] - cy) ** 2)
+                if dist < 0.002:
+                    d[i] = 0.01 * np.exp(-dist / 0.001)
+
+            return d
+
+        ic_u_x = dde.icbc.IC(geomtime, u_x_initial, lambda _, on_initial: on_initial, component=0)
+        ic_u_y = dde.icbc.IC(geomtime, u_y_initial, lambda _, on_initial: on_initial, component=1)
+        ic_p = dde.icbc.IC(geomtime, p_initial, lambda _, on_initial: on_initial, component=2)
+        ic_d = dde.icbc.IC(geomtime, d_initial, lambda _, on_initial: on_initial, component=3)
+
+        return [ic_u_x, ic_u_y, ic_p, ic_d]
+
+    def output_transform(self, x, y):
+        """输出变换"""
+        u_x = y[:, 0:1]
+        u_y = y[:, 1:2]
+
+        # 压力变换
+        p_raw = y[:, 2:3]
+        x_coord = x[:, 0:1]
+        y_coord = x[:, 1:2]
+
+        # 边界衰减
+        boundary_decay = (self.Lx - x_coord) * x_coord * (self.Ly - y_coord) * y_coord / (self.Lx ** 2 * self.Ly ** 2)
+        p = p_raw * boundary_decay
+
+        # 损伤变换
+        d_raw = y[:, 3:4]
+        d = torch.sigmoid(d_raw)
+
+        return torch.cat([u_x, u_y, p, d], dim=1)
+
+    def train_model(self):
+        """训练过程"""
+        print("Starting training...")
+        start_time = time.time()
+
+        # 定义几何和时间域
+        geom = dde.geometry.Rectangle([0, 0], [self.Lx, self.Ly])
+        timedomain = dde.geometry.TimeDomain(0, self.injection_time)
+        geomtime = dde.geometry.GeometryXTime(geom, timedomain)
+
+        # 获取边界条件和初始条件
+        bcs = self.boundary_conditions(geomtime)
+        ics = self.initial_conditions(geomtime)
+
+        # 创建训练数据集
+        data = dde.data.TimePDE(
+            geomtime,
+            self.pde,
+            bcs + ics,
+            num_domain=self.num_domain,
+            num_boundary=self.num_boundary,
+            num_initial=self.num_initial
+        )
+
+        # 使用更小的网络
+        net = dde.nn.FNN([3] + [64] * 3 + [4], "tanh", "Glorot normal")
+        net.apply_output_transform(self.output_transform)
+
+        model = dde.Model(data, net)
+
+        # 训练策略
+        print("Phase 1 training...")
+        model.compile("adam", lr=1e-4)
+        losshistory, train_state = model.train(iterations=1000, display_every=200)
+
+        print("Phase 2 training...")
+        model.compile("adam", lr=1e-5)
+        losshistory, train_state = model.train(iterations=500, display_every=100)
+
+        total_time = time.time() - start_time
+        print(f"Training completed in {total_time / 60:.2f} minutes")
+
+        return model
+
+    def plot_damage_field_only(self, model, t=1.0, resolution=50):
+        """绘制损伤场"""
+        x = np.linspace(0, self.Lx, resolution)
+        y = np.linspace(0, self.Ly, resolution)
+        X, Y = np.meshgrid(x, y)
+
+        points = np.vstack([X.ravel(), Y.ravel(), t * np.ones(X.ravel().shape[0])]).T
+
+        prediction = model.predict(points)
+        damage_field = prediction[:, 3].reshape(X.shape)
+
+        plt.figure(figsize=(8, 6))
+        contour = plt.contourf(X, Y, damage_field, levels=20, cmap='Reds', vmin=0, vmax=1)
+        plt.colorbar(contour, label='Damage Field (φ)')
+        plt.xlabel('X (m)')
+        plt.ylabel('Y (m)')
+        plt.title(f'Damage Field at t = {t:.2f} s')
+
+        plt.plot(self.injection_x, self.injection_y, 'bo', markersize=8, label='Injection Point')
+        plt.legend()
+
+        plt.tight_layout()
+        plt.savefig(f'damage_field_t_{t:.2f}.png', dpi=300, bbox_inches='tight')
+        plt.show()
+
+        return damage_field
+
+
+def main():
+    """主函数"""
+    print("=" * 60)
+    print("Hydraulic Fracture Simulation - Fixed Version")
+    print("=" * 60)
+
+    try:
+        # 创建模拟器实例
+        simulator = ImprovedHydraulicFracture()
+
+        # 训练模型
+        model = simulator.train_model()
+
+        # 保存模型
+        model.save("fixed_fracture_model")
+
+        # 生成裂纹图
+        print("\nGenerating crack patterns...")
+        time_points = [0.2, 0.5, 0.8, 1.0]
+        for t in time_points:
+            print(f"Time point: t = {t:.2f} s")
+            damage_field = simulator.plot_damage_field_only(model, t=t)
+
+            max_damage = np.max(damage_field)
+            if max_damage > 0.3:
+                print(f"✓ Crack detected at t={t:.2f}s (max damage: {max_damage:.3f})")
+            else:
+                print(f"✗ No significant crack detected at t={t:.2f}s (max damage: {max_damage:.3f})")
+
+        print("\n" + "=" * 60)
+        print("Simulation completed!")
+        print("=" * 60)
+
+    except Exception as e:
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()
