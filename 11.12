@@ -47,6 +47,7 @@ c0 = 5e6  # Pa (cohesion)
 phi_fric = math.radians(45.0)  # friction angle in radians
 sinphi = math.sin(phi_fric)
 cosphi = math.cos(phi_fric)
+tanphi = math.tan(phi_fric)
 
 # Background principal stresses (compressive < 0 in mechanics, here follow + as tension -> use negatives)
 # We'll model a confining pressure by setting sigma0 = -Pc * I; for simplicity keep zeros and rely on u-BCs.
@@ -85,6 +86,11 @@ def heaviside(x):
     return 0.5 * (torch.sign(x) + 1.0)
 
 
+def batch_trace(tensor):
+    """Trace over the last two dims while supporting batch dimensions."""
+    return tensor.diagonal(dim1=-2, dim2=-1).sum(-1)
+
+
 def split_strain(eps):
     """Miehe-type spectral tension/compression split (approx.)
     eps: [..., 2, 2]
@@ -106,7 +112,7 @@ def split_strain(eps):
     return eps_p, eps_m
 
 
-def strain(u):
+def strain(u, X):
     """Small strain tensor from displacement field u = [ux, uy]."""
     ux = u[..., 0:1]
     uy = u[..., 1:2]
@@ -119,7 +125,6 @@ def strain(u):
     e11 = dux_dx
     e22 = duy_dy
     e12 = 0.5 * (dux_dy + duy_dx)
-    zero = torch.zeros_like(e11)
     eps = torch.stack(
         [torch.cat([e11, e12], dim=1), torch.cat([e12, e22], dim=1)], dim=-1
     )
@@ -128,9 +133,8 @@ def strain(u):
 
 
 def deviator(eps):
-    tr = torch.trace(eps)
-    tr = tr.view(-1, 1, 1)
-    I = torch.eye(2, device=eps.device, dtype=eps.dtype).expand_as(eps)
+    tr = batch_trace(eps).unsqueeze(-1).unsqueeze(-1)
+    I = torch.eye(2, device=eps.device, dtype=eps.dtype)
     return eps - 0.5 * tr * I
 
 
@@ -139,8 +143,8 @@ def elastic_energies(eps):
     HI ~ volumetric tension energy, HII ~ shear (deviatoric) energy in tension part.
     """
     eps_p, eps_m = split_strain(eps)
-    tr_p = torch.trace(eps_p).view(-1, 1)
-    tr_m = torch.trace(eps_m).view(-1, 1)
+    tr_p = batch_trace(eps_p).unsqueeze(-1)
+    tr_m = batch_trace(eps_m).unsqueeze(-1)
     # Energy densities per Miehe split
     psi_plus = 0.5 * lam * tr_p**2 + mu * torch.sum(eps_p * eps_p, dim=(-2, -1))
     psi_minus = 0.5 * lam * tr_m**2 + mu * torch.sum(eps_m * eps_m, dim=(-2, -1))
@@ -162,8 +166,8 @@ def stress_effective(eps, phi):
     d = degradation(phi)
     # Construct stress from split tensors
     I = torch.eye(2, device=eps.device, dtype=eps.dtype)
-    tr_p = torch.trace(eps_p).view(-1, 1, 1)
-    tr_m = torch.trace(eps_m).view(-1, 1, 1)
+    tr_p = batch_trace(eps_p).unsqueeze(-1).unsqueeze(-1)
+    tr_m = batch_trace(eps_m).unsqueeze(-1).unsqueeze(-1)
     sigma = d.view(-1, 1, 1) * (lam * tr_p * I + 2 * mu * eps_p) + (lam * tr_m * I + 2 * mu * eps_m)
     return sigma
 
@@ -204,8 +208,8 @@ def GcII_degraded(sigma1, sigma3, p):
     # Use effective principal stresses adding Biot term
     sig1_eff = sigma1 + alpha_biot * p + sigma0_1
     sig3_eff = sigma3 + alpha_biot * p + sigma0_3
-    inner = (c0 / torch.tan(torch.tensor(phi_fric, device=sig1_eff.device, dtype=sig1_eff.dtype)) \
-             - 0.5 * (sig1_eff + sig3_eff)) - alpha_biot * p * 0.0  # alpha*p already added above
+    cohesion_term = sig1_eff.new_tensor(c0 / tanphi)
+    inner = (cohesion_term - 0.5 * (sig1_eff + sig3_eff)) - alpha_biot * p * 0.0  # alpha*p already added above
     num = (inner ** 2) * (sinphi ** 2) * (cosphi ** 2)
     denom = (1e-12 + (c0 ** 2))  # scale with cohesion to keep units reasonable
     GcII = GcI * num / denom
@@ -242,13 +246,8 @@ def pde(X, Y):
     phi = Y[:, 2:3]
     p = Y[:, 3:4]
 
-    # Displacement vector for strain
-    global X  # to allow gradient calls inside strain()
-    # Build a pseudo field tensor for gradients
-    # DeepXDE passes X to grad via closure; we reuse the same X symbol
-
     # Strain tensor
-    eps = strain(torch.cat([ux, uy], dim=1))  # [N,2,2]
+    eps = strain(torch.cat([ux, uy], dim=1), X)  # [N,2,2]
 
     # Effective stress (tension/compression split with degradation)
     sig_eff = stress_effective(eps, phi)
