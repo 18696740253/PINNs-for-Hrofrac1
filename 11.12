@@ -366,9 +366,15 @@ ic3 = dde.IC(geomtime, ic_p, lambda x, on_b: np.isclose(x[2], 0.0), component=3)
 # ---------------------------------
 
 # Sampling
-nt = 50  # time levels for training points
-nx = 61
-ny = 51
+# The original research notebook used a very dense spatio-temporal sampling grid
+# (50 x 61 x 51 collocation points).  Running the resulting graph differentiation
+# steps on a GPU with ~8 GB memory easily exhausts the available device RAM when
+# combined with the large network and the costly spectral strain split.  To make
+# the setup practical on commodity GPUs we reduce the default grid resolution and
+# allow overriding it via environment variables.
+nt = int(os.getenv("PINN_NT", 24))  # time levels for training points
+nx = int(os.getenv("PINN_NX", 45))
+ny = int(os.getenv("PINN_NY", 37))
 
 observe_times = np.linspace(0.0, Tfinal, nt)
 
@@ -383,7 +389,9 @@ data = dde.data.TimePDE(
 )
 
 # Network
-layer_size = [3] + [128] * 6 + [4]  # inputs: x,y,t -> outputs: ux,uy,phi,p
+# A slightly narrower network keeps the autograd graph smaller without hurting
+# expressivity for the reduced training grid.
+layer_size = [3] + [96] * 5 + [4]  # inputs: x,y,t -> outputs: ux,uy,phi,p
 net = dde.maps.FNN(layer_size, "tanh", "Glorot uniform")
 
 # Tell DeepXDE to use PyTorch module on GPU
