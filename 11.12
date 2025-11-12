@@ -114,13 +114,17 @@ def split_strain(eps):
 
 def strain(u, X):
     """Small strain tensor from displacement field u = [ux, uy]."""
-    ux = u[..., 0:1]
-    uy = u[..., 1:2]
-    # Gradients w.r.t x,y using deepxde gradients
-    dux_dx = dde.grad.jacobian(ux, X, i=0, j=0)
-    dux_dy = dde.grad.jacobian(ux, X, i=0, j=1)
-    duy_dx = dde.grad.jacobian(uy, X, i=1, j=0)
-    duy_dy = dde.grad.jacobian(uy, X, i=1, j=1)
+    # Gradients w.r.t x,y using deepxde gradients. When calling ``dde.grad.jacobian``
+    # the ``i`` argument indexes the output component of ``u``. The displacement
+    # network returns both components at once, so we differentiate the combined
+    # tensor directly instead of slicing individual components. This avoids
+    # constructing intermediate tensors with a single component (which would make
+    # ``i=1`` invalid and trigger runtime errors when deepxde expects the index to
+    # be within the output dimension).
+    dux_dx = dde.grad.jacobian(u, X, i=0, j=0)
+    dux_dy = dde.grad.jacobian(u, X, i=0, j=1)
+    duy_dx = dde.grad.jacobian(u, X, i=1, j=0)
+    duy_dy = dde.grad.jacobian(u, X, i=1, j=1)
     # Build symmetric strain tensor
     e11 = dux_dx
     e22 = duy_dy
