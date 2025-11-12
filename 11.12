@@ -267,7 +267,13 @@ def pde(X, Y):
     sigma22 = sig_total[:, 1, 1:2]
 
     divx = dde.grad.jacobian(sigma11, X, i=0, j=0) + dde.grad.jacobian(sigma12, X, i=0, j=1)
-    divy = dde.grad.jacobian(sigma21, X, i=1, j=0) + dde.grad.jacobian(sigma22, X, i=1, j=1)
+    # ``sigma21`` and ``sigma22`` each contain a single scalar component for every
+    # collocation point (shape ``[N, 1]``).  When differentiating such tensors the
+    # component index ``i`` must therefore be ``0``; using ``i=1`` would be out of
+    # bounds and triggers ``ValueError: i=1 is not valid`` inside DeepXDE's
+    # Jacobian helper.  Switching to ``i=0`` computes the desired derivatives of
+    # σ₂₁ and σ₂₂ with respect to ``x`` and ``y``.
+    divy = dde.grad.jacobian(sigma21, X, i=0, j=0) + dde.grad.jacobian(sigma22, X, i=0, j=1)
 
     mom_x = divx  # = 0
     mom_y = divy  # = 0
